@@ -18,6 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
+#include "usb_hid_keys.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -46,6 +48,9 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
@@ -53,25 +58,47 @@ UART_HandleTypeDef huart3;
 PCD_HandleTypeDef hpcd_USB_FS;
 
 /* USER CODE BEGIN PV */
-uint8_t HID_EpAdd_Inst = HID_EPIN_ADDR;								/* HID Endpoint Address array */
-uint8_t CDC_EpAdd_Inst0[3] = {CDC_IN_EP, CDC_OUT_EP, CDC_CMD_EP}; 	/* CDC Endpoint Addresses array */
-uint8_t CDC_EpAdd_Inst1[3] = {CDC_IN_EP+2, CDC_OUT_EP+1, CDC_CMD_EP+2}; 	/* CDC Endpoint Addresses array */
-uint8_t HID_InstID = 0, CDC_InstID0 = 0, CDC_InstID1 = 0;
 
-uint8_t hid_report_buffer[4];
+#define MAX_VCP_RXBUFFER	128
+#define MAX_VCP_TXBUFFER	128
+#define MAX_DBG_RXBUFFER	64
+#define MAX_DBG_TXBUFFFER	128
 
-USBD_HandleTypeDef hUsbDeviceFS;
+uint8_t bufRxVCP[MAX_VCP_COUNT][MAX_VCP_RXBUFFER], bufRxDebug[MAX_DBG_RXBUFFER];
+uint8_t bufTxVCP[MAX_VCP_COUNT][MAX_VCP_TXBUFFER], bufTxDebug[MAX_DBG_TXBUFFFER];
+
+RingBuffer rbRxVCP[MAX_VCP_COUNT], rbRxDebug;
+RingBuffer rbTxVCP[MAX_VCP_COUNT], rbTxDebug;
+
+UartState uartVCP[MAX_VCP_COUNT], uartDebug;
+
+
+uint8_t hidReport[16];
+
+uint16_t adcValue[2];
+uint32_t adcAverage[2];
+
+uint8_t mouseButton;
+int8_t mouseMovement[2]; // [UP/DOWN, LEFT/RIGHT]
+
+
+
+extern USBD_HandleTypeDef hUsbDeviceFS;
+extern uint8_t HID_InstID, CDC_InstID0, CDC_InstID1;
+
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART3_UART_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
-
+extern void DualVCP_UartInit();
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -87,10 +114,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-	hid_report_buffer[0] = 0;
-	hid_report_buffer[1] = 100;
-	hid_report_buffer[2] = 0;
-	hid_report_buffer[3] = 0;
+  memset(&hidReport, 0, sizeof(hidReport));
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -111,57 +135,107 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
-	/* Initialize the USB Device Library */
-	if(USBD_Init(&hUsbDeviceFS, &Dev_Desc, 0) != USBD_OK)
-		Error_Handler();
+  MX_USB_DEVICE_Init();
 
-	/* Store HID Instance Class ID */
-	HID_InstID = hUsbDeviceFS.classId;
+  // initialize RingBuffer
+  for (int i = 0; i < MAX_VCP_COUNT; ++i)
+  {
+	  RB_Init(&rbRxVCP[i], &bufRxVCP[0][0], MAX_VCP_RXBUFFER);
+	  RB_Init(&rbTxVCP[i], &bufTxVCP[0][0], MAX_VCP_TXBUFFER);
+  }
 
-	/* Register the HID Class */
-#if 1
-	if(USBD_RegisterClassComposite(&hUsbDeviceFS, USBD_HID_CLASS, CLASS_TYPE_HID, &HID_EpAdd_Inst) != USBD_OK)
-		Error_Handler();
-#endif
+  RB_Init(&rbRxDebug, &bufRxDebug[0], MAX_VCP_RXBUFFER);
+  RB_Init(&rbTxDebug, &bufTxDebug[0], MAX_VCP_TXBUFFER);
 
-	/* Store CDC#0 Instance Class ID */
-	CDC_InstID0 = hUsbDeviceFS.classId;
+  // initialize UART
+  for (int i = 0; i < MAX_VCP_COUNT; ++i)
+	  UART_Init(&uartVCP[i], i == 0 ? &huart2 : &huart3, &rbRxVCP[i], &rbTxVCP[i]);
 
-	/* Register CDC Class First Instance */
-	if(USBD_RegisterClassComposite(&hUsbDeviceFS, USBD_CDC_CLASS, CLASS_TYPE_CDC, CDC_EpAdd_Inst0) != USBD_OK)
-		Error_Handler();
-
-	/* Store CDC#1 Instance Class ID */
-	CDC_InstID1 = hUsbDeviceFS.classId;
-
-	/* Register CDC Class First Instance */
-	if(USBD_RegisterClassComposite(&hUsbDeviceFS, USBD_CDC_CLASS, CLASS_TYPE_CDC, CDC_EpAdd_Inst1) != USBD_OK)
-		Error_Handler();
+  UART_Init(&uartDebug, &huart1, &rbRxDebug, &rbTxDebug);
 
 
-	/* Add CDC Interface Class */
-	if (USBD_CMPSIT_SetClassID(&hUsbDeviceFS, CLASS_TYPE_CDC, 0) != 0xFF)
-	{
-		USBD_CDC_RegisterInterface(&hUsbDeviceFS, &USBD_CDC_fops);
-	}
-
-	/* Add CDC Interface Class */
-	if (USBD_CMPSIT_SetClassID(&hUsbDeviceFS, CLASS_TYPE_CDC, 1) != 0xFF)
-	{
-		USBD_CDC_RegisterInterface(&hUsbDeviceFS, &USBD_CDC_fops);
-	}
-
-	USBD_Start(&hUsbDeviceFS);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+
+  //
+  mouseButton = 0;
+  memset(&adcAverage[0], 0, sizeof(adcAverage));
+  memset(&mouseMovement[0], 0, sizeof(mouseMovement));
+
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)&adcValue[0], 2);
+
+  //
+  uint32_t lastTick = HAL_GetTick();
   while (1)
   {
+	  //
+	for (int i = 0; i < 2; i++)
+	{
+		//  UART.rxBuf <--- received from UART device
+		//  UART.txBuf <--- received from USB host
+		//
+		//  rx_available : rxBuf is not empty & txUsbLen is zero
+		//    ---> CDC_Transmit()
+		//  tx_available : txBuf is not empty & txUartLen is zero
+		//    ---> HAL_UART_Transmit()
+		//
+		if (UART_RxAvailable(&uartVCP[i]) > 0)
+		{
+			uint16_t len;
+			uint8_t *data = UART_PreserveRxBuffer(&uartVCP[i], USB_FS_MAX_PACKET_SIZE, &len);
+
+			// uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len, uint32_t classId);
+			if (CDC_Transmit_FS(data, len, i == 0 ? CDC_InstID0 : CDC_InstID1) != USBD_OK)
+				UART_CheckoutRxBuffer(&uartVCP[i]);
+		}
+
+		if (UART_TxAvailable(&uartVCP[i]) > 0)
+		{
+			uint16_t len;
+			uint8_t *data = UART_PreserveTxBuffer(&uartVCP[i], -1, &len);
+
+			if (HAL_UART_Transmit_IT(uartVCP[i].pHandle, data, len) != HAL_OK)
+				UART_CheckoutTxBuffer(&uartVCP[i]);
+		}
+	}
+
+	//
+#if 0
+	if (UART_RxAvailable(&uartDebug) > 0)
+	{
+		uint16_t len;
+		uint8_t *data = UART_PreserveRxBuffer(&uartDebug, 64, &len);
+		//
+		// parse incoming
+		//
+		UART_CheckoutRxBuffer(&uartDebug);
+	}
+#endif
+	if (UART_TxAvailable(&uartDebug) > 0)
+	{
+		uint16_t len;
+		uint8_t *data = UART_PreserveTxBuffer(&uartDebug, -1, &len);
+
+		if (HAL_UART_Transmit_IT(uartDebug.pHandle, data, len) != HAL_OK)
+			UART_CheckoutTxBuffer(&uartDebug);
+	}
+
+	//
+	if (HAL_GetTick() - lastTick > 1000)
+	{
+		//printf("%u %u\r\n", adcValue[0], adcValue[1]);
+		lastTick = HAL_GetTick();
+	}
+
+	/*
 	if(HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET)
 	{
 		USBD_HID_SendReport(&hUsbDeviceFS, hid_report_buffer, 4, HID_InstID);
@@ -169,12 +243,14 @@ int main(void)
 		//USBD_CDC_TransmitPacket(&hUsbDeviceFS, CDC_InstID1);
 		HAL_Delay(100);
 	}
+	*/
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
+
 
 /**
   * @brief System Clock Configuration
@@ -215,11 +291,68 @@ void SystemClock_Config(void)
     Error_Handler();
   }
   PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USB;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6; // 12MHz
   PeriphClkInit.UsbClockSelection = RCC_USBCLKSOURCE_PLL_DIV1_5;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 2;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_10;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_11;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -353,6 +486,22 @@ void MX_USB_PCD_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -373,6 +522,12 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOD, GPIO_PIN_2, GPIO_PIN_SET);
 
+  /*Configure GPIO pins : PC13 PC14 PC15 PC12 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15|GPIO_PIN_12;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
   /*Configure GPIO pin : PD2 */
   GPIO_InitStruct.Pin = GPIO_PIN_2;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
@@ -380,17 +535,192 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
   /*Configure GPIO pin : PC13 */
-  GPIO_InitStruct.Pin = GPIO_PIN_13;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+  //GPIO_InitStruct.Pin = GPIO_PIN_13;
+  //GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  //GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  //HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+#if 1
+#ifdef __GNUC__
+#define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
+#else
+#define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
+#endif /* __GNUC__ */
+
+PUTCHAR_PROTOTYPE
+{
+  // Transmit a single character via the specified UART handle (e.g., &huart2)
+	UART_Transmit(&uartDebug, (uint8_t *)&ch, 1);
+  return ch;
+}
+#else
+int _write(int file, char *ptr, int len)
+{
+    // Transmit the string via the specified UART handle (e.g., &huart2)
+    //HAL_UART_Transmit(&huart1, (uint8_t*)ptr, len, HAL_MAX_DELAY);
+	UART_Transmit(&uartDebug, (uint8_t *)ptr, (uint16_t)len);
+    return len;
+}
+#endif
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+	if (huart == &huart1)
+	{
+		UART_CheckoutTxBuffer(&uartDebug);
+	}
+	else if (huart == &huart2)
+	{
+		UART_CheckoutTxBuffer(&uartVCP[0]);
+	}
+	else if (huart == &huart3)
+	{
+		UART_CheckoutTxBuffer(&uartVCP[1]);
+	}
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+	if (huart == &huart1)
+	{
+		UART_ProcessReceive(&uartDebug);
+	}
+	else if (huart == &huart2)
+	{
+		UART_ProcessReceive(&uartVCP[0]);
+	}
+	else if (huart == &huart3)
+	{
+		UART_ProcessReceive(&uartVCP[1]);
+	}
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+
+}
+
+void ReportKeyboard()
+{
+
+}
+
+void ReportMouse(uint8_t button, uint8_t moveX, uint8_t moveY)
+{
+	hidReport[0] = 2;
+	hidReport[1] = button;
+	hidReport[2] = moveX;
+	hidReport[3] = moveY;
+
+	USBD_HID_SendReport(&hUsbDeviceFS, hidReport, 9, HID_InstID);
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+{
+	static uint32_t count = 0;
+
+	adcAverage[0] += adcValue[0];
+	adcAverage[1] += adcValue[1];
+
+	if (++count >= 1000)
+	{
+		adcAverage[0] /= count;
+		adcAverage[1] /= count;
+		count = 0;
+
+		//printf("%u %u\r\n", (unsigned int)adcAverage[0], (unsigned int)adcAverage[1]);
+		int deltaY = ((int)adcAverage[0] - 1992) / 14;
+		int deltaX = ((int)adcAverage[1] - 1988) / 14;
+
+		if (deltaY < -100)
+			deltaY = -100;
+		if (deltaY > 100)
+			deltaY = 100;
+		if (deltaX < -100)
+			deltaX = -100;
+		if (deltaX > 100)
+			deltaX = 100;
+
+		deltaX = -deltaX;
+
+		if (mouseMovement[0] != deltaY || mouseMovement[1] != deltaX)
+		{
+			mouseMovement[0] = deltaY;
+			mouseMovement[1] = deltaX;
+
+			ReportMouse(mouseButton, mouseMovement[1], mouseMovement[0]);
+		}
+	}
+}
+
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+	GPIO_PinState state = HAL_GPIO_ReadPin(GPIOC, GPIO_Pin);
+
+	switch (GPIO_Pin)
+	{
+	case GPIO_PIN_15:
+		/*
+		hidReport[0] = 1;
+		hidReport[1] = 0;
+		hidReport[2] = 0;
+		hidReport[3] = state == GPIO_PIN_RESET ? KEY_LEFT : 0;
+
+		USBD_HID_SendReport(&hUsbDeviceFS, hidReport, 9, HID_InstID);
+		*/
+		if (state == GPIO_PIN_RESET)
+			mouseButton |= 0x01;
+		else
+			mouseButton &= ~0x01;
+		ReportMouse(mouseButton, mouseMovement[1], mouseMovement[0]);
+		break;
+	case GPIO_PIN_14:
+		/*
+		hidReport[0] = 1;
+		hidReport[1] = 0;
+		hidReport[2] = 0;
+		hidReport[3] = state == GPIO_PIN_RESET ? KEY_ENTER : 0;
+
+		USBD_HID_SendReport(&hUsbDeviceFS, hidReport, 9, HID_InstID);
+		*/
+		if (state == GPIO_PIN_RESET)
+			mouseButton |= 0x04;
+		else
+			mouseButton &= ~0x04;
+		ReportMouse(mouseButton, mouseMovement[1], mouseMovement[0]);
+		break;
+	case GPIO_PIN_13:
+		/*
+		hidReport[0] = 1;
+		hidReport[1] = 0;
+		hidReport[2] = 0;
+		hidReport[3] = state == GPIO_PIN_RESET ? KEY_RIGHT : 0;
+
+		USBD_HID_SendReport(&hUsbDeviceFS, hidReport, 9, HID_InstID);
+		*/
+		if (state == GPIO_PIN_RESET)
+			mouseButton |= 0x02;
+		else
+			mouseButton &= ~0x02;
+		ReportMouse(mouseButton, mouseMovement[1], mouseMovement[0]);
+		break;
+
+	case GPIO_PIN_12:
+		//ReportMouse(state == GPIO_PIN_RESET ? 0x01 : 0, mouseMovement[1], mouseMovement[0]);
+		break;
+	}
+}
 
 /* USER CODE END 4 */
 

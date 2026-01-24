@@ -24,6 +24,7 @@ EndBSPDependencies */
 /* Includes ------------------------------------------------------------------*/
 #include "usbd_cdc_if.h"
 #include "usbd_composite_builder.h"
+#include "main.h"
 
 /** @addtogroup STM32_USB_DEVICE_LIBRARY
   * @{
@@ -79,7 +80,11 @@ USBD_CDC_ItfTypeDef USBD_CDC_fops =
   DualVCP_TransmitCplt
 };
 
-USBD_CDC_LineCodingTypeDef linecoding[2] =
+
+//extern UART_HandleTypeDef huart2;
+//extern UART_HandleTypeDef huart3;
+
+USBD_CDC_LineCodingTypeDef linecoding[MAX_VCP_COUNT] =
 {
 	{
 	  115200, /* baud rate*/
@@ -98,13 +103,19 @@ USBD_CDC_LineCodingTypeDef linecoding[2] =
 #define APP_RX_DATA_SIZE	64
 #define APP_TX_DATA_SIZE	64
 
-uint8_t UserRxBufferFS[2][APP_RX_DATA_SIZE];
-uint8_t UserTxBufferFS[2][APP_TX_DATA_SIZE];
 
+uint8_t UserRxBufferFS[MAX_VCP_COUNT][APP_RX_DATA_SIZE];
+#if 0
+uint8_t UserTxBufferFS[MAX_VCP_COUNT][APP_TX_DATA_SIZE];
+#endif
 
+extern UartState uartVCP[MAX_VCP_COUNT];
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
+
+
 /* Private functions ---------------------------------------------------------*/
+
 
 /**
   * @brief  TEMPLATE_Init
@@ -116,7 +127,9 @@ static int8_t DualVCP_Init(uint32_t id)
 {
   uint32_t idx = USBD_CMPIT_GetInstNbr(&hUsbDeviceFS, id);
 
-  USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS[idx], 0, id);
+  //
+  uint8_t *data = UART_PreserveRxBuffer(&uartVCP[idx], 0, NULL);
+  USBD_CDC_SetTxBuffer(&hUsbDeviceFS, data, 0, id);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS[idx]);
 
   return (USBD_OK);
@@ -130,9 +143,10 @@ static int8_t DualVCP_Init(uint32_t id)
   */
 static int8_t DualVCP_DeInit(uint32_t id)
 {
-  /*
-     Add your deinitialization code here
-  */
+  //
+  uint32_t idx = USBD_CMPIT_GetInstNbr(&hUsbDeviceFS, id);
+  UART_DeInit(&uartVCP[idx]);
+
   return (USBD_OK);
 }
 
@@ -180,7 +194,12 @@ static int8_t DualVCP_Control(uint32_t id, uint8_t cmd, uint8_t *pbuf, uint16_t 
       linecoding[idx].paritytype = pbuf[5];
       linecoding[idx].datatype   = pbuf[6];
 
-      /* Add your code here */
+      //
+      UART_Config(&uartVCP[idx],
+    		  linecoding[idx].bitrate,
+			  linecoding[idx].format,
+			  linecoding[idx].paritytype,
+			  linecoding[idx].datatype);
       break;
 
     case CDC_GET_LINE_CODING:
@@ -231,11 +250,14 @@ static int8_t DualVCP_Receive(uint32_t id, uint8_t *Buf, uint32_t *Len)
   //
   //
   uint32_t idx = USBD_CMPIT_GetInstNbr(&hUsbDeviceFS, id);
+#if TEST_LOOPBACK
   memcpy(&UserTxBufferFS[idx][0], Buf, *Len);
   CDC_Transmit_FS(&UserTxBufferFS[idx][0], *Len, id);
+#else
+  UART_Transmit(&uartVCP[idx], Buf, *Len);
+#endif
   //
   //
-
 
   //
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
@@ -258,9 +280,9 @@ static int8_t DualVCP_Receive(uint32_t id, uint8_t *Buf, uint32_t *Len)
   */
 static int8_t DualVCP_TransmitCplt(uint32_t id, uint8_t *Buf, uint32_t *Len, uint8_t epnum)
 {
-  UNUSED(Buf);
-  UNUSED(Len);
-  UNUSED(epnum);
+  //
+  uint32_t idx = USBD_CMPIT_GetInstNbr(&hUsbDeviceFS, id);
+  UART_CheckoutRxBuffer(&uartVCP[idx]);
 
   return (USBD_OK);
 }
